@@ -11,7 +11,10 @@ They look like this:
 - a one-line footer asking readers to comment on the Archive
 
 Chapter boundaries come from those bold banners, so the EPUB table of contents
-matches the PDF outline. Lines that the PDF wrapped are joined back into
+matches the PDF outline. Works with custom chapter titles ("Year 13 (Part 1)"),
+and other exporters (such as wkhtmltopdf) whose headings are smaller or whose
+font flags are unreliable. When the PDF has an embedded outline, its entries
+are also used to find chapter headings. Lines that the PDF wrapped are joined back into
 paragraphs, and italic and bold runs are kept.
 
 A PDF with no large bold headings falls back to a single chapter.
@@ -39,9 +42,22 @@ from ebooklib import epub
 from tqdm import tqdm
 import pymupdf
 
-FOOTER_START = "Please drop by the Archive and comment"
+FOOTER_START = "please drop by the archive and comment"
 # AO3 labels that are headings in the text but are the same size as body copy.
-STANDALONE_HEADINGS = {"Summary", "Notes", "End Notes"}
+STANDALONE_HEADINGS = {
+    "Summary",
+    "Notes",
+    "End Notes",
+    "Chapter Summary",
+    "Chapter Notes",
+    "Chapter End Notes",
+}
+# Ratios of a line's font size to the body size.
+BANNER_RATIO = 1.2
+SUBHEAD_RATIO = 1.08
+BOLD_FONT_HINTS = ("bold", "black", "heavy", "semibold", "demi", "-medi")
+LIGHT_FONT_HINTS = ("regular", "-regu", "roman", "book", "light")
+ITALIC_FONT_HINTS = ("italic", "oblique", "ital")
 LANGUAGE_CODES = {
     "english": "en",
     "spanish": "es",
@@ -136,6 +152,7 @@ class Line:
     size: float
     runs: list[Run]
     raw: str
+    outline: bool = False
 
     @property
     def text(self) -> str:
@@ -179,6 +196,21 @@ def clean_title(text: str) -> str:
     return normalize_space(text.replace("\xa0", " ").replace("\n", " "))
 
 
+def font_is_bold(font: str, flags: int) -> bool:
+    """Prefer the font name over the flags, which some exporters set on every span."""
+    name = font.casefold()
+    if any(hint in name for hint in BOLD_FONT_HINTS):
+        return True
+    if any(hint in name for hint in LIGHT_FONT_HINTS) or "ital" in name:
+        return False
+    return bool(flags & 16)
+
+
+def font_is_italic(font: str, flags: int) -> bool:
+    name = font.casefold()
+    return any(hint in name for hint in ITALIC_FONT_HINTS) or bool(flags & 2)
+
+
 def load_lines(doc: pymupdf.Document) -> list[Line]:
     lines: list[Line] = []
     for page_index, page in enumerate(doc):
@@ -197,8 +229,8 @@ def load_lines(doc: pymupdf.Document) -> list[Line]:
                     runs.append(
                         Run(
                             text=span["text"],
-                            italic="Italic" in font or "Oblique" in font or bool(flags & 2),
-                            bold="Bold" in font or bool(flags & 16),
+                            italic=font_is_italic(font, flags),
+                            bold=font_is_bold(font, flags),
                         )
                     )
                 raw = "".join(raw_parts)
@@ -226,16 +258,41 @@ def body_size(lines: list[Line]) -> float:
 
 def is_banner(line: Line, body: float) -> bool:
     """Large bold line AO3 uses for the work title and 'Chapter N'."""
-    return line.bold_line and line.size >= body * 1.3 and len(line.plain) < 120
+    if line.outline:
+        return True
+    return line.bold_line and line.size >= body * BANNER_RATIO and len(line.plain) < 120
 
 
 def is_subhead(line: Line, body: float) -> bool:
     """Smaller bold line AO3 uses for the author's chapter title."""
     return (
         line.bold_line
-        and body * 1.08 <= line.size < body * 1.3
+        and body * SUBHEAD_RATIO <= line.size < body * BANNER_RATIO
         and len(line.plain) < 160
     )
+
+
+def mark_outline_headings(doc: pymupdf.Document, lines: list[Line]) -> None:
+    """Flag the line on each outline entry's page whose text is the entry title.
+
+    The outline is the most reliable record of where chapters start, whatever
+    the heading's font size or style is.
+    """
+    by_page: dict[int, list[Line]] = {}
+    for line in lines:
+        by_page.setdefault(line.page, []).append(line)
+    for _level, title, page in doc.get_toc(simple=True):
+        wanted = clean_title(title).casefold()
+        if not wanted or page < 1:
+            continue
+        matches = [
+            line
+            for line in by_page.get(page - 1, [])
+            if line.plain.casefold() == wanted and len(line.plain) < 160
+        ]
+        if matches:
+            # The title can repeat on a page (running header); the heading is the largest.
+            max(matches, key=lambda line: line.size).outline = True
 
 
 def is_label(line: Line) -> bool:
@@ -284,10 +341,14 @@ def gap_threshold(lines: list[Line], body: float) -> float:
     return max(6.0, body * 0.5)
 
 
+def is_footer(line: Line) -> bool:
+    return FOOTER_START in line.plain.casefold()
+
+
 def starts_new_paragraph(prev: Line | None, line: Line, threshold: float) -> bool:
     if prev is None:
         return True
-    if FOOTER_START in line.raw or FOOTER_START in prev.plain:
+    if is_footer(line) or is_footer(prev):
         return True
     if line.starts_with_indent or prev.ends_with_break:
         return True
@@ -360,11 +421,23 @@ def cleanup_runs(runs: list[Run]) -> list[Run]:
         kept.pop()
 
     # Move boundary spaces out of italic/bold so tags don't wrap the space.
+    # A space between two words in the same style keeps that style so the run
+    # stays whole ("<em>two words</em>" rather than "<em>two</em> <em>words</em>").
     for index, (ch, italic, bold) in enumerate(kept):
-        if ch != " ":
+        if ch != " " or not (italic or bold):
             continue
-        if italic or bold:
-            kept[index] = (" ", False, False)
+        before = kept[index - 1] if index > 0 else None
+        after = kept[index + 1] if index + 1 < len(kept) else None
+        if (
+            before
+            and after
+            and before[0] != " "
+            and after[0] != " "
+            and before[1:] == (italic, bold)
+            and after[1:] == (italic, bold)
+        ):
+            continue
+        kept[index] = (" ", False, False)
 
     merged: list[Run] = []
     for ch, italic, bold in kept:
@@ -614,6 +687,7 @@ def convert(pdf_path: Path, epub_path: Path) -> list[str]:
             )
         meta = doc.metadata or {}
         lines = load_lines(doc)
+        mark_outline_headings(doc, lines)
     finally:
         doc.close()
 
@@ -629,7 +703,7 @@ def convert(pdf_path: Path, epub_path: Path) -> list[str]:
             (
                 index
                 for index, line in enumerate(sections[-1].lines)
-                if FOOTER_START in line.raw or FOOTER_START in line.plain
+                if is_footer(line)
             ),
             None,
         )
