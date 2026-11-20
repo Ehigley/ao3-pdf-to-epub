@@ -19,10 +19,13 @@ paragraphs, and italic and bold runs are kept.
 
 A PDF with no large bold headings falls back to a single chapter.
 
-A directory of PDFs can be converted in one run. Each PDF keeps its path
-relative to the source directory and is written into the target directory
-with a .epub suffix. The batch is split across processes and tracked with
-a progress bar.
+AO3's "Download -> HTML" files are also accepted (see ao3_html.py). An HTML file
+becomes an EPUB by default, or a PDF with --pdf. PDFs can only become EPUBs.
+
+A directory of PDFs and HTML files can be converted in one run. Each file keeps
+its path relative to the source directory and is written into the target
+directory with a .epub (or, for HTML with --pdf, .pdf) suffix. The batch is
+split across processes and tracked with a progress bar.
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ from pathlib import Path
 from ebooklib import epub
 from tqdm import tqdm
 import pymupdf
+
+import ao3_html
 
 FOOTER_START = "please drop by the archive and comment"
 # AO3 labels that are headings in the text but are the same size as body copy.
@@ -61,6 +66,7 @@ ITALIC_FONT_HINTS = ("italic", "oblique", "ital")
 LANGUAGE_CODES = {
     "english": "en",
     "spanish": "es",
+    "español": "es",
     "français": "fr",
     "french": "fr",
     "deutsch": "de",
@@ -734,49 +740,97 @@ def convert(pdf_path: Path, epub_path: Path) -> list[str]:
     return [section.label for section in sections]
 
 
+HTML_SUFFIXES = {".html", ".htm"}
+SOURCE_SUFFIXES = {".pdf"} | HTML_SUFFIXES
+OUTPUT_SUFFIXES = {".epub", ".pdf"}
+
+
+def output_suffix(source: Path, as_pdf: bool) -> str:
+    """HTML becomes a PDF only when asked for; everything else becomes an EPUB."""
+    return ".pdf" if as_pdf and source.suffix.lower() in HTML_SUFFIXES else ".epub"
+
+
+def convert_html(html_path: Path, output_path: Path, as_pdf: bool) -> list[str]:
+    try:
+        work = ao3_html.parse_work(html_path)
+        if as_pdf:
+            return ao3_html.write_pdf(work, output_path)
+        language = LANGUAGE_CODES.get(work.language.casefold(), "en")
+        return ao3_html.write_epub(work, output_path, CSS, language)
+    except ao3_html.WorkError as exc:
+        raise ConversionError(str(exc)) from exc
+
+
+Job = tuple[Path, Path, bool]  # source, output, write a PDF
+
+
 @dataclass
 class JobResult:
-    pdf_path: Path
-    epub_path: Path
+    source: Path
+    output: Path
     labels: list[str] = field(default_factory=list)
     error: str | None = None
 
 
-def find_pdfs(source: Path) -> list[Path]:
-    """Every PDF under source, skipping hidden files and directories."""
+def find_sources(source: Path, as_pdf: bool) -> list[Path]:
+    """Every convertible file under source, skipping hidden files and directories.
+
+    With as_pdf only HTML is wanted, since a PDF has nothing to convert to.
+    """
     if source.is_file():
         return [source]
-    pdfs = [
+    suffixes = HTML_SUFFIXES if as_pdf else SOURCE_SUFFIXES
+    found = [
         path
         for path in source.rglob("*")
         if path.is_file()
-        and path.suffix.lower() == ".pdf"
+        and path.suffix.lower() in suffixes
         and not any(part.startswith(".") for part in path.relative_to(source).parts)
     ]
-    return sorted(pdfs)
+    return sorted(found)
 
 
-def destination_for(source: Path, pdf: Path, target: Path | None) -> Path:
+def destination_for(source: Path, path: Path, target: Path | None, as_pdf: bool) -> Path:
+    suffix = output_suffix(path, as_pdf)
     if source.is_file():
         if target is None:
-            return pdf.with_suffix(".epub")
+            return path.with_suffix(suffix)
         if target.is_dir():
-            return target / f"{pdf.stem}.epub"
+            return target / f"{path.stem}{suffix}"
         return target
     if target is None:
         raise ConversionError("a target directory is required when source is a directory")
-    return target / pdf.relative_to(source).with_suffix(".epub")
+    return target / path.relative_to(source).with_suffix(suffix)
 
 
-def _convert_job(job: tuple[Path, Path]) -> JobResult:
-    pdf_path, epub_path = job
+def drop_duplicates(jobs: list[Job]) -> tuple[list[Job], list[tuple[Path, Path]]]:
+    """Keep one source per output file, preferring HTML over a PDF of the same work.
+
+    Returns the jobs to run and (skipped, kept) pairs for the ones left out.
+    """
+    chosen: dict[Path, Job] = {}
+    skipped: list[tuple[Path, Path]] = []
+    ordered = sorted(jobs, key=lambda job: (job[1], job[0].suffix.lower() == ".pdf", job[0]))
+    for job in ordered:
+        if job[1] in chosen:
+            skipped.append((job[0], chosen[job[1]][0]))
+        else:
+            chosen[job[1]] = job
+    return sorted(chosen.values(), key=lambda job: job[0]), skipped
+
+
+def _convert_job(job: Job) -> JobResult:
+    source, output, as_pdf = job
     try:
-        labels = convert(pdf_path, epub_path)
+        if source.suffix.lower() in HTML_SUFFIXES:
+            labels = convert_html(source, output, as_pdf)
+        else:
+            labels = convert(source, output)
     except ConversionError as exc:
-        return JobResult(pdf_path, epub_path, error=str(exc))
+        return JobResult(source, output, error=str(exc))
     except Exception as exc:
-        return JobResult(pdf_path, epub_path, error=f"{exc.__class__.__name__}: {exc}")
-    return JobResult(pdf_path, epub_path, labels=labels)
+        return JobResult(source, output, error=f"{exc.__class__.__name__}: {exc}")
+    return JobResult(source, output, labels=labels)
 
 
 def worker_count(requested: int | None, jobs: int) -> int:
@@ -787,15 +841,15 @@ def worker_count(requested: int | None, jobs: int) -> int:
     return max(1, min(chosen, jobs))
 
 
-def convert_all(jobs: list[tuple[Path, Path]], workers: int) -> list[JobResult]:
+def convert_all(jobs: list[Job], workers: int) -> list[JobResult]:
     """Convert every job, using a process pool when there is more than one worker."""
     results: list[JobResult] = []
-    with tqdm(total=len(jobs), unit="pdf", desc="Converting") as bar:
+    with tqdm(total=len(jobs), unit="file", desc="Converting") as bar:
         def take(result: JobResult) -> None:
             results.append(result)
             if result.error:
-                bar.write(f"failed: {result.pdf_path.name}: {result.error}")
-            bar.set_postfix_str(result.pdf_path.name, refresh=False)
+                bar.write(f"failed: {result.source.name}: {result.error}")
+            bar.set_postfix_str(result.source.name, refresh=False)
             bar.update()
 
         if workers <= 1:
@@ -814,7 +868,7 @@ def report_one(result: JobResult) -> int:
     if result.error:
         print(result.error, file=sys.stderr)
         return 1
-    print(f"Wrote {result.epub_path}")
+    print(f"Wrote {result.output}")
     print("Contents:")
     for label in result.labels:
         print(f"  {label}")
@@ -824,7 +878,7 @@ def report_one(result: JobResult) -> int:
 def report_batch(results: list[JobResult], target: Path) -> int:
     failed = sorted(
         (result for result in results if result.error),
-        key=lambda result: result.pdf_path,
+        key=lambda result: result.source,
     )
     written = len(results) - len(failed)
     print(f"Wrote {written} of {len(results)} to {target}")
@@ -832,33 +886,45 @@ def report_batch(results: list[JobResult], target: Path) -> int:
         return 0
     print("Failed:", file=sys.stderr)
     for result in failed:
-        print(f"  {result.pdf_path.name}: {result.error}", file=sys.stderr)
+        print(f"  {result.source.name}: {result.error}", file=sys.stderr)
     return 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Convert AO3 PDF downloads to EPUBs, one chapter per section."
+        description=(
+            "Convert AO3 downloads to EPUBs, one chapter per section. "
+            "Accepts PDF and HTML files; HTML can be written as PDF with --pdf."
+        )
     )
     parser.add_argument(
         "source",
         type=Path,
-        help="PDF file, or a directory of PDFs (subfolders included)",
+        help="AO3 PDF or HTML file, or a directory of them (subfolders included)",
     )
     parser.add_argument(
         "target",
         nargs="?",
         type=Path,
         help=(
-            "EPUB file, or a directory to write one EPUB per PDF. "
-            "Required for a directory. A lone PDF is written beside itself."
+            "output file, or a directory to write one output per source file. "
+            "Required for a directory. A lone file is written beside itself."
         ),
     )
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        help="EPUB path for a single PDF (an alternative to passing target)",
+        help="output path for a single file (an alternative to passing target)",
+    )
+    parser.add_argument(
+        "-p",
+        "--pdf",
+        action="store_true",
+        help=(
+            "write PDFs instead of EPUBs for HTML files. PDF sources can only "
+            "become EPUBs, so a directory run skips them"
+        ),
     )
     parser.add_argument(
         "-j",
@@ -882,36 +948,64 @@ def main(argv: list[str] | None = None) -> int:
     if not source.exists():
         print(f"No such file or directory: {source}", file=sys.stderr)
         return 1
-    if source.is_file() and source.suffix.lower() != ".pdf":
-        print(f"Not a PDF: {source}", file=sys.stderr)
-        return 1
+    if source.is_file():
+        if source.suffix.lower() not in SOURCE_SUFFIXES:
+            print(f"Not a PDF or HTML file: {source}", file=sys.stderr)
+            return 1
+        if args.pdf and source.suffix.lower() == ".pdf":
+            print(
+                f"{source.name} is already a PDF. --pdf is for converting HTML files; "
+                "a PDF can only be converted to an EPUB.",
+                file=sys.stderr,
+            )
+            return 1
+        wanted = output_suffix(source, args.pdf)
+        if (
+            target is not None
+            and not target.is_dir()
+            and target.suffix.lower() in OUTPUT_SUFFIXES
+            and target.suffix.lower() != wanted
+        ):
+            print(
+                f"Output {target.name} must end in {wanted}"
+                + ("" if args.pdf else " (pass --pdf to write a PDF)"),
+                file=sys.stderr,
+            )
+            return 1
     if source.is_dir():
         if target is None:
             parser.error("a target directory is required when source is a directory")
         if target.exists() and not target.is_dir():
             print(f"Target is not a directory: {target}", file=sys.stderr)
             return 1
-        if not target.exists() and target.suffix.lower() == ".epub":
+        if not target.exists() and target.suffix.lower() in OUTPUT_SUFFIXES:
             print(
                 f"Target must be a directory when source is a directory: {target}",
                 file=sys.stderr,
             )
             return 1
-        target.mkdir(parents=True, exist_ok=True)
 
-    pdfs = find_pdfs(source)
-    if not pdfs:
-        print(f"No PDFs found in {source}", file=sys.stderr)
+    sources = find_sources(source, args.pdf)
+    if not sources:
+        kind = "HTML files" if args.pdf else "PDF or HTML files"
+        print(f"No {kind} found in {source}", file=sys.stderr)
         return 1
 
-    jobs = [(pdf, destination_for(source, pdf, target)) for pdf in pdfs]
+    jobs: list[Job] = [
+        (path, destination_for(source, path, target, args.pdf), args.pdf) for path in sources
+    ]
     if source.is_file():
         return report_one(_convert_job(jobs[0]))
 
-    if target is None:
-        parser.error("a target directory is required when source is a directory")
+    jobs, skipped = drop_duplicates(jobs)
+    for dropped, kept in skipped:
+        print(
+            f"Skipping {dropped.name}: {kept.name} is converted to the same file",
+            file=sys.stderr,
+        )
+    target.mkdir(parents=True, exist_ok=True)
     workers = worker_count(args.jobs, len(jobs))
-    print(f"Converting {len(jobs)} PDFs with {workers} workers")
+    print(f"Converting {len(jobs)} files with {workers} workers")
     results = convert_all(jobs, workers)
     return report_batch(results, target)
 
